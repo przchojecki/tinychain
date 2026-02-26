@@ -21,6 +21,8 @@ The roadmap is intentionally line-budgeted. `tiny001.ts` is the strict sub-1000 
 
 Execution is an account/nonce model with canonical integer amounts and Ed25519 transaction signatures. A block must start with a coinbase transaction constrained to exact reward semantics, while normal transactions are validated/applied sequentially against state (`balances`, `nonces`) with strict overflow and replay controls; mempool policy includes sender caps, minimum relay fee, and nonce-based RBF with mandatory fee bump. Networking is intentionally minimal HTTP gossip/sync: `/tx` and `/block` relay by default, peer routes are token-gated, `/chain` is additionally signed with timestamp+nonce and replay protection, and snapshot files support keyed integrity MACs for safer persistence.
 
+Mining in both `tiny002` and `tiny001` is intentionally plain CPU PoW (iterating nonce over SHA-256 header commitments) to keep implementation and verification minimal. Cuckoo-style PoW (e.g., Cuckoo Cycle / Cuckatoo variants) is a valid future direction if you want stronger memory-hard properties and different ASIC economics, but it would require replacing `checkPow`/mining loops, redefining difficulty/work accounting, and re-baselining interoperability vectors; that tradeoff was deferred to keep the current chain compact and operationally simple.
+
 ## Status (February 26, 2026)
 
 `tiny002` has completed hardening items 1-6 and is launch-ready from an implementation perspective (with item 7 intentionally deferred).
