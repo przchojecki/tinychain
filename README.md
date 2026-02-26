@@ -7,7 +7,7 @@ The roadmap is intentionally line-budgeted. `tiny001.ts` is the strict sub-1000 
 ## Current Track
 
 - Active core: `tiny002.ts`
-- Core LOC: `1995`
+- Core LOC: `1996`
 - Runtime: Node.js `>=24`
 - Consensus style: single-file PoW chain with strict validation, account model, HTTP gossip/sync, signed peer auth for chain sync
 - Baseline core: `tiny001.ts`
@@ -51,7 +51,27 @@ npm run selftest
 npm run itest
 ```
 
-Generate a keypair:
+Version run map:
+
+- `tiny002.ts` (default/current):
+
+```bash
+npm run node -- --port=3001
+npm run check
+npm run selftest
+npm run keygen
+```
+
+- `tiny001.ts` (legacy baseline):
+
+```bash
+npm run node:legacy -- --port=3001
+node --check tiny001.ts
+node tiny001.ts --selftest
+node tiny001.ts --keygen
+```
+
+Generate a keypair (tiny002 default):
 
 ```bash
 npm run keygen
@@ -205,13 +225,6 @@ Intentional minimalism:
 - `TINYCHAIN_HTTP_TIMEOUT_MS`: outbound RPC timeout (`5000` default)
 - `TINYCHAIN_OPEN_RELAY`: permissionless `/tx` + `/block` when `1` (default)
 - `TINYCHAIN_UNSAFE_DEV=I_UNDERSTAND`: unlock unsafe dev toggles
-
-## Release Checklist (tiny002)
-
-- [x] `npm run check`
-- [x] `npm run selftest`
-- [x] `npm run itest`
-- [ ] Add `LICENSE` before broad public release
 
 ## License
 
