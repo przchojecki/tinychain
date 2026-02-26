@@ -15,6 +15,12 @@ The roadmap is intentionally line-budgeted. `tiny001.ts` is the strict sub-1000 
 - Runtime: Node.js `>=24`
 - Consensus style: minimal single-file PoW chain profile
 
+## Blockchain Architecture
+
+`tiny002` uses Nakamoto-style Proof-of-Work consensus on a linear chain. Each block commits `prev`, `height`, `timestamp`, `difficulty`, `nonce`, `txRoot`, and `miner`, and validity requires SHA-256 PoW under bounded difficulty (`14..40`). Target cadence is 10 seconds with a bounded DAA (window `60`, max step `2`) plus timestamp safety (`MTP=11`, future skew cap), and chain selection is strictly greatest cumulative work (sum of per-block work weight). Issuance is deterministic via subsidy halvings every `210000` blocks, with miner payout equal to `subsidy(height) + fees`.
+
+Execution is an account/nonce model with canonical integer amounts and Ed25519 transaction signatures. A block must start with a coinbase transaction constrained to exact reward semantics, while normal transactions are validated/applied sequentially against state (`balances`, `nonces`) with strict overflow and replay controls; mempool policy includes sender caps, minimum relay fee, and nonce-based RBF with mandatory fee bump. Networking is intentionally minimal HTTP gossip/sync: `/tx` and `/block` relay by default, peer routes are token-gated, `/chain` is additionally signed with timestamp+nonce and replay protection, and snapshot files support keyed integrity MACs for safer persistence.
+
 ## Status (February 26, 2026)
 
 `tiny002` has completed hardening items 1-6 and is launch-ready from an implementation perspective (with item 7 intentionally deferred).
