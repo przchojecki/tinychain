@@ -1,0 +1,18 @@
+{
+  "name": "tinychain",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "check": "node --check tiny001.ts",
+    "selftest": "node tiny001.ts --selftest",
+    "keygen": "node tiny001.ts --keygen",
+    "node": "node tiny001.ts"
+  },
+  "dependencies": {
+    "tweetnacl": "^1.0.3"
+  }
+}
