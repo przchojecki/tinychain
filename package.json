@@ -1,6 +1,6 @@
 {
   "name": "tinychain",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -9,6 +9,7 @@
   "scripts": {
     "check": "node --check tiny002.ts",
     "selftest": "node tiny002.ts --selftest",
+    "itest": "node tests/integration.mjs",
     "keygen": "node tiny002.ts --keygen",
     "node": "node tiny002.ts",
     "node:legacy": "node tiny001.ts"

@@ -4,316 +4,204 @@
 
 The roadmap is line-budgeted by design. `tiny001.ts` is the strict sub-1000 LOC baseline (minimal but hardened enough to run), while `tiny002.ts` expands the same architecture under a sub-2000 LOC ceiling to add stronger public-network safety: better peer admission, authenticated peer traffic, optional TLS, encrypted wallets, and richer operator CLI/menu flows.
 
-Current implementation:
+## Current Track
 
-- Core file: `tiny002.ts`
-- Core LOC: `1687`
-- Language/runtime: TypeScript syntax running on modern Node.js
-- Scope: single-file node + HTTP API + miner + richer CLI (including interactive menu)
+- Active core: `tiny002.ts`
+- Core LOC: `1764`
+- Runtime: Node.js `>=24`
+- Consensus style: single-file PoW chain with strict validation, simple account model, and HTTP-based gossip/sync
 
-This repository is intentionally optimized for clarity and small size, not feature breadth.
+## Status (February 26, 2026)
 
-## Status
+`tiny002` is now a strong release candidate for a serious public **testnet** launch.
 
-As of **February 26, 2026**, the chain is a strong minimal prototype and can run as a small public test network.
-It is **not yet ready for an adversarial “serious mainnet” launch** without additional hardening.
+Already implemented:
 
-`tiny002.ts` additions vs `tiny001.ts`:
-
-- Expanded CLI and interactive menu (`--menu`) for operator workflows.
-- Method-aware rate limits that now include GET endpoints.
-- Rate-limit state sweeping/capping to avoid unbounded memory growth.
-- DNS-resolved peer admission checks (reject private/link-local resolution targets).
-- Peer persistence (`.tinychain/peers.json`) and basic peer failure scoring/eviction.
-- Protocol identity on API (`/hello`, `chainId`, `protocol`, `app` fields in `/tip`).
-- Optional local-dev override for peer filtering: `TINYCHAIN_ALLOW_PRIVATE_PEERS=1`.
-
-## Goals
-
-- Keep consensus logic understandable and auditable.
-- Keep implementation line-budgeted: `tiny001` under 1000 LOC and `tiny002` under 2000 LOC.
-- Support CPU mining and simple peer-to-peer syncing.
-- Provide CLI operations for humans and agents.
+- Strict peer auth boundary (no implicit loopback bypass unless explicit unsafe-dev flag)
+- Snapshot integrity metadata + keyed snapshot MAC verification (`TINYCHAIN_SNAPSHOT_KEY`)
+- Public-bind safety guardrails (TLS + advertise + auth secrets required)
+- Encrypted wallet keystore (AES-256-GCM + scrypt) with hidden passphrase prompt
+- Peer/node identity hardening (`nodeId`, self-peer and duplicate-node rejection)
+- CI matrix + deterministic selftest + adversarial multi-node integration test
 
 ## Repository Layout
 
-- `tiny002.ts`: current implementation (active).
-- `tiny001.ts`: previous constrained sub-1000 LOC implementation.
-- `tiny001.pretrim.ts`: earlier expanded/pre-trim variant.
-- `tinychain.ts`: earlier implementation variant.
-- `README.md`: this document.
+- `tiny002.ts`: active implementation (<2000 LOC target)
+- `tiny001.ts`: previous constrained implementation (<1000 LOC target)
+- `tests/integration.mjs`: multi-node integration/adversarial checks
+- `.github/workflows/ci.yml`: CI (`check`, `selftest`, `itest`)
+- `README.md`: this document
 
 ## Quick Start
 
-## 1) Prerequisites
-
-- Node.js `>= 24` (for direct `.ts` execution in this setup)
-- npm
-
-## 2) Install dependency
+### 1) Install deps
 
 ```bash
-npm install
+npm ci
 ```
 
-## 3) Run deterministic self-test
+### 2) Verify build + tests
 
 ```bash
+npm run check
 npm run selftest
+npm run itest
 ```
 
-Expected: JSON output with `"ok": true` and deterministic vector hashes.
-
-## 4) Generate a keypair
+### 3) Generate keys
 
 ```bash
 npm run keygen
 ```
 
-Returns:
+## Local Two-Node Dev Smoke Run
 
-- `pub`: 32-byte public key hex
-- `secret`: 64-byte secret key hex (Ed25519 secretKey, 128 hex chars)
-
-## 5) Start a node
-
-```bash
-npm run node -- --port=3001
-```
-
-Start mining on the node:
-
-```bash
-npm run node -- --port=3001 --mine=<MINER_PUB_HEX>
-```
-
-## 6) Join peers at startup
-
-```bash
-npm run node -- --port=3002 --peers=http://127.0.0.1:3001
-```
-
-## CLI Commands
-
-Supported CLI flags in `tiny002.ts`:
-
-- `--keygen`
-- `--selftest`
-- `--port=<n>`
-- `--mine=<pubhex>`
-- `--peers=<origin1,origin2,...>`
-- `--sign-tx='<json>' --secret=<secretHex>`
-- `--sign-tx='<json>' --secret=<secretHex> --send-tx --node=<origin>`
-- `--send-tx --tx='<signedTxJson>' --node=<origin>`
-- `--tip` / `--state=<pubhex>` / `--mempool` / `--list-peers`
-- `--add-peer=<origin>` / `--sync-now` (optionally with `--admin-token=<token>`)
-- `--wallet-new=<file>` / `--wallet-pub=<file>` / `--wallet=<file>`
-- `--menu`
-
-Notes:
-
-- `--difficulty` is intentionally disabled (consensus profile is frozen).
-- `--node` defaults to `http://127.0.0.1:3001` for send operations.
-
-### Transaction Signing Example
-
-```bash
-npm run node -- \
-  --secret=<SENDER_SECRET_HEX> \
-  --sign-tx='{"to":"<RECIPIENT_PUB_HEX>","amount":"10","fee":"1","nonce":"1"}'
-```
-
-Sign and broadcast in one step:
-
-```bash
-npm run node -- \
-  --secret=<SENDER_SECRET_HEX> \
-  --sign-tx='{"to":"<RECIPIENT_PUB_HEX>","amount":"10","fee":"1","nonce":"1"}' \
-  --send-tx \
-  --node=http://127.0.0.1:3001
-```
-
-## HTTP API
-
-Base URL: `http://<host>:<port>`
-
-Read endpoints:
-
-- `GET /tip`
-- `GET /chain?from=<height>&limit=<n>`
-- `GET /state?acct=<pubhex>`
-- `GET /mempool`
-- `GET /peers`
-
-Write endpoints:
-
-- `POST /tx` (broadcast signed transaction)
-- `POST /block` (broadcast mined block)
-- `POST /peers` (admin-only)
-- `POST /sync` (admin-only)
-
-Current POST rate limits (per IP, 10s window):
-
-- `/tx`: 120
-- `/block`: 40
-- `/peers`: 8
-- `/sync`: 4
-
-## Consensus Rules (Current)
-
-Network identity:
-
-- `CHAIN_ID = tinychain-main-001`
-
-Genesis:
-
-- `height = 0`
-- `prev = 00..00 (32 bytes)`
-- `timestamp = 1700000000000`
-- `difficulty = 3`
-- `txs = []`
-
-PoW:
-
-- Hash function: SHA-256 over canonical JSON array fields
-- Rule: block hash must start with `difficulty` leading hex `0`
-- Difficulty bounds: `[1..12]`
-
-Difficulty adjustment:
-
-- Target block time: `10s`
-- Retarget interval: `20` blocks
-- Adjusts using bounded interval timing; clamped to min/max difficulty
-
-Time validity:
-
-- Block timestamp must be `> medianTimePast(last 11 blocks)`
-- Block timestamp must be monotonic vs parent
-- Block timestamp must be `<= now + 2 minutes`
-
-Transaction rules:
-
-- Ed25519 signatures
-- Canonical unsigned decimal string amounts/fees/nonces
-- Strict nonce progression per account (`expected nonce = state nonce + 1`)
-- Balance + overflow/underflow protections via bounded bigint arithmetic
-
-Block rules:
-
-- `txs[0]` must be coinbase
-- Coinbase reward must equal `BLOCK_REWARD + totalFees`
-- Max non-coinbase txs per block: `200`
-- Header shape/range checks enforced
-
-Chain selection:
-
-- Choose candidate with greater accumulated work
-- Full candidate chain is re-validated before adoption
-
-## Networking + Sync Behavior
-
-- Peer list in-memory, max peers: `128`
-- Sync lock and cooldown prevent overlap/thrashing
-- Sync range bounded by:
-  - max forward height window (`MAX_SYNC_AHEAD`)
-  - max chunk count per attempt (`MAX_SYNC_CHUNKS_PER_ATTEMPT`)
-- Snapshot persistence to `.tinychain/chain.json`
-
-## Security Hardening Included
-
-Implemented in current core:
-
-- Canonical header shape/range checks in append + full-chain validation
-- Body size limit (`1MB`) for request parsing
-- Sync response byte limit (`2MB`) and streamed response reading
-- Peer URL normalization and peer count cap
-- Admin-gated `/peers` and `/sync`
-- POST endpoint rate limiting
-- Seen caches for txs/blocks with capped size
-- Deterministic `--selftest` path for consensus regression checks
-
-## Known Gaps Before “Serious Public Mainnet”
-
-These are the main blockers found in the latest audit:
-
-1. PoW security remains toy-level (leading-zero SHA-256; low max difficulty).
-2. Admin model can be unsafe behind reverse proxies if loopback trust is not isolated.
-3. Peer host filtering is literal-host based and does not resolve DNS targets.
-4. GET endpoints are currently not rate-limited.
-5. Rate-limit state map has no eviction/cleanup policy.
-6. Peer protocol is intentionally minimal (no handshake/version negotiation/ban scoring/discovery persistence).
-
-Conclusion: good minimal public testnet candidate; not hardened enough for adversarial-value mainnet yet.
-
-## Suggested Next Hardening Steps
-
-Priority order:
-
-1. Replace toy PoW with stronger economic security model, or significantly strengthen work target model.
-2. Enforce strict token-only admin mode for non-local deployments.
-3. Add GET endpoint limits + periodic eviction for rate-limit state.
-4. Add DNS resolution checks for peer admission (block private/link-local targets after resolution).
-5. Add peer scoring/ban heuristics and durable peer store.
-6. Add CI with deterministic consensus vectors and negative test corpus.
-
-## Two-Node Smoke Run
+Local private peers are blocked by default. For localhost testing only, run with explicit unsafe-dev toggles.
 
 Terminal A:
 
 ```bash
+TINYCHAIN_UNSAFE_DEV=I_UNDERSTAND \
 TINYCHAIN_ALLOW_PRIVATE_PEERS=1 \
+TINYCHAIN_ADMIN_TOKEN=dev-admin \
+TINYCHAIN_PEER_TOKEN=dev-peer \
+TINYCHAIN_SNAPSHOT_KEY=dev-snapshot \
 npm run node -- --port=3001 --mine=<PUB_A>
 ```
 
 Terminal B:
 
 ```bash
+TINYCHAIN_UNSAFE_DEV=I_UNDERSTAND \
 TINYCHAIN_ALLOW_PRIVATE_PEERS=1 \
+TINYCHAIN_ADMIN_TOKEN=dev-admin \
+TINYCHAIN_PEER_TOKEN=dev-peer \
+TINYCHAIN_SNAPSHOT_KEY=dev-snapshot \
 npm run node -- --port=3002 --peers=http://127.0.0.1:3001
 ```
 
-Add peer from A to B (optional):
+Query with peer token:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:3001/peers \
-  -H 'content-type: application/json' \
-  -d '{"peer":"http://127.0.0.1:3002"}'
+curl -sS http://127.0.0.1:3001/tip -H 'x-peer-token: dev-peer'
 ```
 
-Query tip:
+## Public Launch Guardrails (Enforced)
+
+If binding non-loopback (`--public` or `--host` not localhost/127.0.0.1/::1), startup now requires:
+
+- `--advertise=<origin,...>`
+- TLS cert + key (`--tls-cert`, `--tls-key` or env variants)
+- `TINYCHAIN_ADMIN_TOKEN`
+- `TINYCHAIN_PEER_TOKEN`
+- `TINYCHAIN_SNAPSHOT_KEY`
+- No `TINYCHAIN_UNSAFE_DEV`
+
+Example:
 
 ```bash
-curl -sS http://127.0.0.1:3001/tip
+TINYCHAIN_ADMIN_TOKEN='<strong-admin-token>' \
+TINYCHAIN_PEER_TOKEN='<strong-peer-token>' \
+TINYCHAIN_SNAPSHOT_KEY='<strong-snapshot-key>' \
+TINYCHAIN_TLS_CERT=/etc/tinychain/tls.crt \
+TINYCHAIN_TLS_KEY=/etc/tinychain/tls.key \
+npm run node -- \
+  --public \
+  --port=3001 \
+  --advertise=https://203.0.113.10:3001 \
+  --seeds=https://198.51.100.11:3001,https://198.51.100.12:3001
 ```
 
-## Release/Publish to GitHub (`przchojecki/tinychain`)
+## Bootstrap / Seed Strategy
 
-Repository prep (run once):
+Startup peer candidates are merged from:
 
-```bash
-git init
-git branch -M main
-git remote add origin git@github.com:przchojecki/tinychain.git
-```
+1. persisted peer snapshot (`.tinychain/peers.json`)
+2. `TINYCHAIN_BOOTSTRAP_SEEDS`
+3. `--seeds=<origin,...>`
+4. `TINYCHAIN_SEED_FILE`
+5. `--seed-file=<path>`
+6. `--peers=<origin,...>`
 
-Commit:
+Operational recommendation:
 
-```bash
-git add README.md tiny002.ts tiny001.ts tiny001.pretrim.ts tinychain.ts package.json .gitignore
-git commit -m "docs: finalize tinychain spec and launch notes"
-```
+- Publish 3-5 stable public seed nodes.
+- Version and publish a canonical seed file.
+- Rotate seeds via rolling updates, not all at once.
 
-Push:
+## CLI Highlights (`tiny002.ts`)
 
-```bash
-git push -u origin main
-```
+- Node/startup: `--port`, `--host`, `--public`, `--mine`, `--advertise`
+- Peer bootstrap: `--peers`, `--seeds`, `--seed-file`
+- RPC client ops: `--tip`, `--state`, `--mempool`, `--list-peers`, `--add-peer`, `--sync-now`
+- Wallet: `--wallet-new`, `--wallet-pub`, `--wallet`, `--wallet-pass`
+- TX: `--sign-tx`, `--send-tx`, `--tx`, `--secret`
+- UX: `--menu`, `--selftest`, `--keygen`
 
-If HTTPS is preferred:
+Useful CLI auth flags:
 
-```bash
-git remote set-url origin https://github.com/przchojecki/tinychain.git
-```
+- `--admin-token=<token>` for admin routes
+- `--peer-token=<token>` for peer-authenticated reads/writes
+
+## HTTP API
+
+Read:
+
+- `GET /hello`
+- `GET /tip`
+- `GET /chain?from=<height>&limit=<n>`
+- `GET /state?acct=<pubhex>`
+- `GET /mempool`
+- `GET /peers`
+
+Write:
+
+- `POST /tx`
+- `POST /block`
+- `POST /peers` (admin)
+- `POST /sync` (admin)
+
+Auth model:
+
+- Peer routes require `x-peer-token` when `TINYCHAIN_PEER_TOKEN` is set.
+- Admin routes require `x-admin-token`.
+
+## Consensus Snapshot
+
+- Chain ID: `tinychain-main-001`
+- Block target: `10s`
+- Retarget interval: `20`
+- Difficulty bounds: `[8..40]`, initial `18`
+- MTP window: `11`
+- Max future skew: `2 minutes`
+- Max non-coinbase tx per block: `200`
+- Chain selection: greatest accumulated work
+
+## Security Model Summary
+
+Implemented:
+
+- Canonical tx/header validation and bounded numeric economics
+- PoW difficulty schedule with bounded retarget adjustments
+- Rate limits + bounded rate state
+- Peer admission hardening + peer cap + peer failure eviction
+- Peer auth token and admin token controls
+- Snapshot atomic writes + metadata + optional keyed MAC verification
+- Encrypted wallet storage (v2) and hidden passphrase prompt
+
+Still intentionally minimal:
+
+- HTTP-based gossip instead of full encrypted p2p protocol stack
+- No economic finality gadgets beyond work-based longest-chain rule
+- Toy-scale PoW economics (appropriate for testnet / experimental network)
+
+## Release Checklist (tiny002)
+
+- [x] `npm run check`
+- [x] `npm run selftest`
+- [x] `npm run itest`
+- [x] CI matrix on Node 24/25 with lockfile (`npm ci`)
+- [ ] Add LICENSE before broad public distribution
 
 ## License
 

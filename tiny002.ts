@@ -1,6 +1,6 @@
 import http from "node:http";
 import https from "node:https";
-import { createHash, timingSafeEqual, randomBytes, scryptSync, createCipheriv, createDecipheriv } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual, randomBytes, scryptSync, createCipheriv, createDecipheriv } from "node:crypto";
 import net from "node:net";
 import readline from "node:readline/promises";
 import { URL } from "node:url";
@@ -90,9 +90,13 @@ const UNSAFE_DEV_MODE = process.env.TINYCHAIN_UNSAFE_DEV === "I_UNDERSTAND";
 const STRICT_ADMIN = process.env.TINYCHAIN_STRICT_ADMIN !== "0";
 const ALLOW_LOOPBACK_ADMIN = process.env.TINYCHAIN_ALLOW_LOOPBACK_ADMIN === "1";
 const ALLOW_PRIVATE_PEERS = process.env.TINYCHAIN_ALLOW_PRIVATE_PEERS === "1";
+const ALLOW_LOOPBACK_PEER_AUTH = process.env.TINYCHAIN_ALLOW_LOOPBACK_PEER_AUTH === "1";
 const TLS_CERT_ENV = process.env.TINYCHAIN_TLS_CERT || "";
 const TLS_KEY_ENV = process.env.TINYCHAIN_TLS_KEY || "";
 const WALLET_PASS_ENV = process.env.TINYCHAIN_WALLET_PASSPHRASE || "";
+const SNAPSHOT_KEY = process.env.TINYCHAIN_SNAPSHOT_KEY || "";
+const BOOTSTRAP_SEEDS_ENV = process.env.TINYCHAIN_BOOTSTRAP_SEEDS || "";
+const SEED_FILE_ENV = process.env.TINYCHAIN_SEED_FILE || "";
 const DATA_DIR = process.env.TINYCHAIN_DATA_DIR || ".tinychain";
 const CHAIN_FILE = path.join(DATA_DIR, "chain.json");
 const PEERS_FILE = path.join(DATA_DIR, "peers.json");
@@ -337,11 +341,14 @@ function expectedDifficultyForNext(chain: Block[]): number {
 function saveChainSnapshot(): void {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
+    const count = chain.length;
+    const chainHash = chainSnapshotHash(chain);
     const meta = {
       version: SNAPSHOT_VERSION,
       nodeId,
-      count: chain.length,
-      chainHash: chainSnapshotHash(chain),
+      count,
+      chainHash,
+      mac: snapshotMac("chain", chainHash, count, SNAPSHOT_VERSION),
       createdAt: Date.now(),
     };
     const tmp = CHAIN_FILE + ".tmp";
@@ -434,6 +441,18 @@ function chainSnapshotHash(c: Block[]): Hex {
 function peersSnapshotHash(p: string[]): Hex {
   return sha256Hex(JSON.stringify(p));
 }
+function snapshotMac(kind: "chain" | "peers", hash: Hex, count: number, version: number): string {
+  if (!SNAPSHOT_KEY) return "";
+  return createHmac("sha256", SNAPSHOT_KEY)
+    .update(`${CHAIN_ID}|${kind}|${version}|${count}|${hash}`)
+    .digest("hex");
+}
+function verifySnapshotMac(kind: "chain" | "peers", hash: Hex, count: number, version: number, mac: any): boolean {
+  if (typeof mac !== "string" || !isHashHex(mac)) return false;
+  if (!SNAPSHOT_KEY) return false;
+  const want = snapshotMac(kind, hash, count, version);
+  return safeEq(want, mac);
+}
 function hostForOrigin(host: string): string {
   return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 }
@@ -493,11 +512,14 @@ function savePeersSnapshot(): void {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     const sorted = Array.from(peers).sort();
+    const count = sorted.length;
+    const peersHash = peersSnapshotHash(sorted);
     const meta = {
       version: SNAPSHOT_VERSION,
       nodeId,
-      count: sorted.length,
-      peersHash: peersSnapshotHash(sorted),
+      count,
+      peersHash,
+      mac: snapshotMac("peers", peersHash, count, SNAPSHOT_VERSION),
       createdAt: Date.now(),
     };
     const tmp = PEERS_FILE + ".tmp";
@@ -556,6 +578,10 @@ function assertListenHost(host: string): void {
   if (net.isIP(h) > 0) return;
   throw new Error("bad --host (use literal IP/localhost)");
 }
+function isLoopbackBindHost(host: string): boolean {
+  const h = host.trim().toLowerCase();
+  return h === "127.0.0.1" || h === "::1" || h === "localhost";
+}
 function isAdmin(req: http.IncomingMessage): boolean {
   const t = req.headers["x-admin-token"];
   const tokenOk = Boolean(ADMIN_TOKEN && typeof t === "string" && safeEq(ADMIN_TOKEN, t));
@@ -569,7 +595,7 @@ function peerAuthHeaders(token = PEER_TOKEN): Record<string, string> {
 }
 function peerAuthOk(req: http.IncomingMessage): boolean {
   if (!PEER_TOKEN) return true;
-  if (isLocalIp(remoteIp(req))) return true;
+  if (UNSAFE_DEV_MODE && ALLOW_LOOPBACK_PEER_AUTH && isLocalIp(remoteIp(req))) return true;
   const t = req.headers["x-peer-token"];
   return typeof t === "string" && safeEq(PEER_TOKEN, t);
 }
@@ -624,6 +650,28 @@ async function normPeer(p: string): Promise<string> {
     return "";
   }
 }
+function parseOriginList(raw: string): string[] {
+  return raw
+    .split(/\r?\n/)
+    .flatMap((line) => line.split(","))
+    .map((s) => s.trim())
+    .filter((s) => s && !s.startsWith("#"));
+}
+function readSeedFile(seedFile: string): string[] {
+  const raw = fs.readFileSync(seedFile, "utf8");
+  return parseOriginList(raw);
+}
+async function addPeerCandidates(list: string[]): Promise<boolean> {
+  let changed = false;
+  for (const p of list) {
+    const n = await normPeer(p);
+    if (!n || peers.has(n) || isSelfPeerOrigin(n)) continue;
+    if (peers.size >= MAX_PEERS) break;
+    peers.add(n);
+    changed = true;
+  }
+  return changed;
+}
 async function loadPeersSnapshot(): Promise<void> {
   try {
     if (!fs.existsSync(PEERS_FILE)) return;
@@ -631,10 +679,18 @@ async function loadPeersSnapshot(): Promise<void> {
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed?.peers)) return;
     if (parsed?.meta && typeof parsed.meta === "object") {
-      const versionOk = Number.isSafeInteger(parsed.meta.version) && parsed.meta.version <= SNAPSHOT_VERSION;
-      const countOk = Number.isSafeInteger(parsed.meta.count) && parsed.meta.count === parsed.peers.length;
-      const hashOk = typeof parsed.meta.peersHash === "string" && parsed.meta.peersHash === peersSnapshotHash(parsed.peers.slice().sort());
+      const version = Number(parsed.meta.version);
+      const count = Number(parsed.meta.count);
+      const hash = peersSnapshotHash(parsed.peers.slice().sort());
+      const versionOk = Number.isSafeInteger(version) && version <= SNAPSHOT_VERSION;
+      const countOk = Number.isSafeInteger(count) && count === parsed.peers.length;
+      const hashOk = typeof parsed.meta.peersHash === "string" && parsed.meta.peersHash === hash;
+      const hasMac = typeof parsed.meta.mac === "string";
+      const macOk = hasMac ? verifySnapshotMac("peers", hash, count, version, parsed.meta.mac) : !SNAPSHOT_KEY;
       if (!versionOk || !countOk || !hashOk) throw new Error("bad-peers-meta");
+      if (!macOk) throw new Error(hasMac ? "bad-peers-mac" : "missing-peers-mac");
+    } else if (SNAPSHOT_KEY) {
+      throw new Error("missing-peers-meta");
     }
     for (const p of parsed.peers) {
       if (typeof p !== "string") continue;
@@ -884,10 +940,18 @@ function loadChainSnapshot(): void {
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed?.chain)) throw new Error("bad-snapshot-format");
     if (parsed?.meta && typeof parsed.meta === "object") {
-      const versionOk = Number.isSafeInteger(parsed.meta.version) && parsed.meta.version <= SNAPSHOT_VERSION;
-      const countOk = Number.isSafeInteger(parsed.meta.count) && parsed.meta.count === parsed.chain.length;
-      const hashOk = typeof parsed.meta.chainHash === "string" && parsed.meta.chainHash === chainSnapshotHash(parsed.chain);
+      const version = Number(parsed.meta.version);
+      const count = Number(parsed.meta.count);
+      const hash = chainSnapshotHash(parsed.chain);
+      const versionOk = Number.isSafeInteger(version) && version <= SNAPSHOT_VERSION;
+      const countOk = Number.isSafeInteger(count) && count === parsed.chain.length;
+      const hashOk = typeof parsed.meta.chainHash === "string" && parsed.meta.chainHash === hash;
+      const hasMac = typeof parsed.meta.mac === "string";
+      const macOk = hasMac ? verifySnapshotMac("chain", hash, count, version, parsed.meta.mac) : !SNAPSHOT_KEY;
       if (!versionOk || !countOk || !hashOk) throw new Error("bad-snapshot-meta");
+      if (!macOk) throw new Error(hasMac ? "bad-snapshot-mac" : "missing-snapshot-mac");
+    } else if (SNAPSHOT_KEY) {
+      throw new Error("missing-snapshot-meta");
     }
     const cand = parsed.chain as Block[];
     const res = validateWholeChain(cand);
@@ -1241,14 +1305,17 @@ function usage(): void {
     "tinychain tiny002",
     "node mode:",
     "  --port=3001 --host=127.0.0.1|0.0.0.0 --public --mine=<pubhex> --peers=<origin,...>",
+    "  --seeds=<origin,...> --seed-file=<path> (also env: TINYCHAIN_BOOTSTRAP_SEEDS / TINYCHAIN_SEED_FILE)",
     "  --tls-cert=<pem> --tls-key=<pem>  (or env: TINYCHAIN_TLS_CERT/TINYCHAIN_TLS_KEY)",
     "  --advertise=<origin,origin,...> (optional announced origins)",
+    "  public bind requires: --advertise + TLS + TINYCHAIN_ADMIN_TOKEN + TINYCHAIN_PEER_TOKEN + TINYCHAIN_SNAPSHOT_KEY",
     "  --difficulty is disabled (frozen network profile)",
     "security/env:",
     "  STRICT admin is ON by default; set TINYCHAIN_ADMIN_TOKEN for admin routes",
     "  peer auth: set TINYCHAIN_PEER_TOKEN; peers must send x-peer-token",
     "  unsafe dev toggles require: TINYCHAIN_UNSAFE_DEV=I_UNDERSTAND",
     "  then optionally: TINYCHAIN_STRICT_ADMIN=0 TINYCHAIN_ALLOW_LOOPBACK_ADMIN=1 TINYCHAIN_ALLOW_PRIVATE_PEERS=1",
+    "  loopback peer-auth bypass (dev only): TINYCHAIN_ALLOW_LOOPBACK_PEER_AUTH=1",
     "wallet/tx:",
     "  --keygen",
     "  --wallet-new=<file> [--wallet-pass=<pass>] (writes encrypted wallet v2)",
@@ -1640,7 +1707,7 @@ async function main(): Promise<void> {
     return;
   }
   if (args["difficulty"]) throw new Error("--difficulty is disabled on frozen mainnet profile");
-  if ((!STRICT_ADMIN || ALLOW_LOOPBACK_ADMIN || ALLOW_PRIVATE_PEERS) && !UNSAFE_DEV_MODE) {
+  if ((!STRICT_ADMIN || ALLOW_LOOPBACK_ADMIN || ALLOW_PRIVATE_PEERS || ALLOW_LOOPBACK_PEER_AUTH) && !UNSAFE_DEV_MODE) {
     throw new Error("unsafe toggles require TINYCHAIN_UNSAFE_DEV=I_UNDERSTAND");
   }
   if (STRICT_ADMIN && !ADMIN_TOKEN) throw new Error("strict admin mode requires TINYCHAIN_ADMIN_TOKEN");
@@ -1652,6 +1719,15 @@ async function main(): Promise<void> {
   const tlsKeyPath = args["tls-key"] ? String(args["tls-key"]) : TLS_KEY_ENV;
   const tlsEnabled = Boolean(tlsCertPath || tlsKeyPath);
   if (tlsEnabled && (!tlsCertPath || !tlsKeyPath)) throw new Error("both TLS cert and key are required");
+  const publicBind = !isLoopbackBindHost(host);
+  if (publicBind) {
+    if (UNSAFE_DEV_MODE) throw new Error("public bind forbids TINYCHAIN_UNSAFE_DEV");
+    if (!args["advertise"]) throw new Error("public bind requires --advertise");
+    if (!tlsEnabled) throw new Error("public bind requires TLS cert/key");
+    if (!STRICT_ADMIN || !ADMIN_TOKEN) throw new Error("public bind requires strict admin token");
+    if (!PEER_TOKEN) throw new Error("public bind requires TINYCHAIN_PEER_TOKEN");
+    if (!SNAPSHOT_KEY) throw new Error("public bind requires TINYCHAIN_SNAPSHOT_KEY");
+  }
   let tls: { key: Buffer; cert: Buffer } | null = null;
   if (tlsEnabled) {
     tls = { cert: fs.readFileSync(tlsCertPath), key: fs.readFileSync(tlsKeyPath) };
@@ -1663,17 +1739,14 @@ async function main(): Promise<void> {
   refreshSelfOrigins(args["advertise"] ? String(args["advertise"]) : "");
   loadChainSnapshot();
   await loadPeersSnapshot();
-  if (args["peers"]) {
-    const list = String(args["peers"]).split(",").map(s => s.trim()).filter(Boolean);
-    let changed = false;
-    for (const p of list) {
-      const n = await normPeer(p);
-      if (n && !peers.has(n) && !isSelfPeerOrigin(n)) {
-        peers.add(n);
-        changed = true;
-      }
-      if (peers.size >= MAX_PEERS) break;
-    }
+  const seedFile = args["seed-file"] ? String(args["seed-file"]) : SEED_FILE_ENV;
+  const candidates: string[] = [];
+  if (BOOTSTRAP_SEEDS_ENV) candidates.push(...parseOriginList(BOOTSTRAP_SEEDS_ENV));
+  if (args["seeds"]) candidates.push(...parseOriginList(String(args["seeds"])));
+  if (seedFile) candidates.push(...readSeedFile(seedFile));
+  if (args["peers"]) candidates.push(...parseOriginList(String(args["peers"])));
+  if (candidates.length > 0) {
+    const changed = await addPeerCandidates(candidates);
     if (changed) savePeersSnapshot();
   }
   startServer(port, host, tls);
