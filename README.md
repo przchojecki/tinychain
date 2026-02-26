@@ -10,6 +10,10 @@ The roadmap is line-budgeted by design. `tiny001.ts` is the strict sub-1000 LOC 
 - Core LOC: `1764`
 - Runtime: Node.js `>=24`
 - Consensus style: single-file PoW chain with strict validation, simple account model, and HTTP-based gossip/sync
+- Baseline core: `tiny001.ts`
+- Core LOC: `996`
+- Runtime: Node.js `>=24`
+- Consensus style: single-file PoW chain with strict validation, simple account model, and HTTP-based gossip/sync (minimal profile)
 
 ## Status (February 26, 2026)
 
