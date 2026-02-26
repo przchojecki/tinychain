@@ -1,13 +1,15 @@
 # tinychain
 
-`tinychain` is a minimal blockchain node designed to keep consensus-critical code tiny.
+`tinychain` is a small-chain engineering project: we build intentionally tiny, auditable blockchains where consensus-critical logic stays compact enough for one person to read in a sitting. The project favors pragmatic minimalism over feature sprawl so that node behavior, economics, and networking can be reasoned about directly from source.
+
+The roadmap is line-budgeted by design. `tiny001.ts` is the strict sub-1000 LOC baseline (minimal but hardened enough to run), while `tiny002.ts` expands the same architecture under a sub-2000 LOC ceiling to add stronger public-network safety: better peer admission, authenticated peer traffic, optional TLS, encrypted wallets, and richer operator CLI/menu flows.
 
 Current implementation:
 
-- Core file: `tiny001.ts`
-- Core LOC: `996`
+- Core file: `tiny002.ts`
+- Core LOC: `1687`
 - Language/runtime: TypeScript syntax running on modern Node.js
-- Scope: single-file node + HTTP API + miner + minimal wallet CLI
+- Scope: single-file node + HTTP API + miner + richer CLI (including interactive menu)
 
 This repository is intentionally optimized for clarity and small size, not feature breadth.
 
@@ -16,16 +18,27 @@ This repository is intentionally optimized for clarity and small size, not featu
 As of **February 26, 2026**, the chain is a strong minimal prototype and can run as a small public test network.
 It is **not yet ready for an adversarial “serious mainnet” launch** without additional hardening.
 
+`tiny002.ts` additions vs `tiny001.ts`:
+
+- Expanded CLI and interactive menu (`--menu`) for operator workflows.
+- Method-aware rate limits that now include GET endpoints.
+- Rate-limit state sweeping/capping to avoid unbounded memory growth.
+- DNS-resolved peer admission checks (reject private/link-local resolution targets).
+- Peer persistence (`.tinychain/peers.json`) and basic peer failure scoring/eviction.
+- Protocol identity on API (`/hello`, `chainId`, `protocol`, `app` fields in `/tip`).
+- Optional local-dev override for peer filtering: `TINYCHAIN_ALLOW_PRIVATE_PEERS=1`.
+
 ## Goals
 
 - Keep consensus logic understandable and auditable.
-- Keep implementation below ~1000 LOC for the core node.
+- Keep implementation line-budgeted: `tiny001` under 1000 LOC and `tiny002` under 2000 LOC.
 - Support CPU mining and simple peer-to-peer syncing.
 - Provide CLI operations for humans and agents.
 
 ## Repository Layout
 
-- `tiny001.ts`: current minimal chain implementation (active).
+- `tiny002.ts`: current implementation (active).
+- `tiny001.ts`: previous constrained sub-1000 LOC implementation.
 - `tiny001.pretrim.ts`: earlier expanded/pre-trim variant.
 - `tinychain.ts`: earlier implementation variant.
 - `README.md`: this document.
@@ -82,7 +95,7 @@ npm run node -- --port=3002 --peers=http://127.0.0.1:3001
 
 ## CLI Commands
 
-Supported CLI flags in `tiny001.ts`:
+Supported CLI flags in `tiny002.ts`:
 
 - `--keygen`
 - `--selftest`
@@ -92,6 +105,10 @@ Supported CLI flags in `tiny001.ts`:
 - `--sign-tx='<json>' --secret=<secretHex>`
 - `--sign-tx='<json>' --secret=<secretHex> --send-tx --node=<origin>`
 - `--send-tx --tx='<signedTxJson>' --node=<origin>`
+- `--tip` / `--state=<pubhex>` / `--mempool` / `--list-peers`
+- `--add-peer=<origin>` / `--sync-now` (optionally with `--admin-token=<token>`)
+- `--wallet-new=<file>` / `--wallet-pub=<file>` / `--wallet=<file>`
+- `--menu`
 
 Notes:
 
@@ -244,12 +261,14 @@ Priority order:
 Terminal A:
 
 ```bash
+TINYCHAIN_ALLOW_PRIVATE_PEERS=1 \
 npm run node -- --port=3001 --mine=<PUB_A>
 ```
 
 Terminal B:
 
 ```bash
+TINYCHAIN_ALLOW_PRIVATE_PEERS=1 \
 npm run node -- --port=3002 --peers=http://127.0.0.1:3001
 ```
 
@@ -280,7 +299,7 @@ git remote add origin git@github.com:przchojecki/tinychain.git
 Commit:
 
 ```bash
-git add README.md tiny001.ts tiny001.pretrim.ts tinychain.ts package.json .gitignore
+git add README.md tiny002.ts tiny001.ts tiny001.pretrim.ts tinychain.ts package.json .gitignore
 git commit -m "docs: finalize tinychain spec and launch notes"
 ```
 

@@ -7,10 +7,11 @@
     "node": ">=24"
   },
   "scripts": {
-    "check": "node --check tiny001.ts",
-    "selftest": "node tiny001.ts --selftest",
-    "keygen": "node tiny001.ts --keygen",
-    "node": "node tiny001.ts"
+    "check": "node --check tiny002.ts",
+    "selftest": "node tiny002.ts --selftest",
+    "keygen": "node tiny002.ts --keygen",
+    "node": "node tiny002.ts",
+    "node:legacy": "node tiny001.ts"
   },
   "dependencies": {
     "tweetnacl": "^1.0.3"
