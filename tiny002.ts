@@ -2,6 +2,7 @@ import http from "node:http";
 import https from "node:https";
 import { createHash, createHmac, timingSafeEqual, randomBytes, scryptSync, createCipheriv, createDecipheriv } from "node:crypto";
 import net from "node:net";
+import dns from "node:dns/promises";
 import readline from "node:readline/promises";
 import { URL } from "node:url";
 import fs from "node:fs";
@@ -41,17 +42,23 @@ const MIN_DIFFICULTY = 8;
 const MAX_DIFFICULTY = 40;
 const TARGET_BLOCK_MS = 10_000;
 const RETARGET_INTERVAL = 20;
+const DAA_WINDOW = 60;
+const DAA_MAX_STEP = 2;
 const MTP_WINDOW = 11;
 const GENESIS_TIMESTAMP = 1_700_000_000_000;
 const MAX_TX_PER_BLOCK = 200;
 const MAX_MEMPOOL = 5000;
+const MAX_MEMPOOL_PER_SENDER = 64;
+const MIN_RELAY_FEE = 1n;
 const MAX_BODY_BYTES = 1_000_000;   // 1MB HTTP body limit
 const MAX_FUTURE_MS = 2 * 60_000;   // reject blocks > 2min in future
 const MAX_SYNC_RESPONSE_BYTES = 2_000_000; // cap peer response bytes during sync
 const CHAIN_CHUNK_BLOCKS = 256;     // /chain page size for sync
+const CHAIN_PAGE_TARGET_BYTES = 512_000;
 const MAX_SYNC_AHEAD = 2048;
 const MAX_SYNC_CHUNKS_PER_ATTEMPT = 24;
 const SYNC_COOLDOWN_MS = 5000;
+const SYNC_INTERVAL_MS = 15_000;
 const RATE_WINDOW_MS = 10_000;
 const RATE_SWEEP_MS = 30_000;
 const RATE_STATE_CAP = 50_000;
@@ -97,6 +104,8 @@ const WALLET_PASS_ENV = process.env.TINYCHAIN_WALLET_PASSPHRASE || "";
 const SNAPSHOT_KEY = process.env.TINYCHAIN_SNAPSHOT_KEY || "";
 const BOOTSTRAP_SEEDS_ENV = process.env.TINYCHAIN_BOOTSTRAP_SEEDS || "";
 const SEED_FILE_ENV = process.env.TINYCHAIN_SEED_FILE || "";
+const OPEN_RELAY = process.env.TINYCHAIN_OPEN_RELAY !== "0";
+const PEER_SIG_MAX_SKEW_MS = 60_000;
 const DATA_DIR = process.env.TINYCHAIN_DATA_DIR || ".tinychain";
 const CHAIN_FILE = path.join(DATA_DIR, "chain.json");
 const PEERS_FILE = path.join(DATA_DIR, "peers.json");
@@ -323,19 +332,15 @@ function expectedDifficultyForNext(chain: Block[]): number {
   if (nextHeight === 1) return clamp(INITIAL_DIFFICULTY, MIN_DIFFICULTY, MAX_DIFFICULTY);
   const prev = chain[chain.length - 1];
   let diff = prev.header.difficulty;
-  if (nextHeight % RETARGET_INTERVAL !== 0) return diff;
-  const start = chain[chain.length - RETARGET_INTERVAL].header.timestamp;
+  const spanBlocks = Math.max(1, Math.min(DAA_WINDOW, nextHeight - 1));
+  const start = chain[chain.length - 1 - spanBlocks].header.timestamp;
   const end = prev.header.timestamp;
-  const expected = TARGET_BLOCK_MS * RETARGET_INTERVAL;
+  const expected = TARGET_BLOCK_MS * spanBlocks;
   const actual = clamp(Math.max(1, end - start), Math.floor(expected / 8), expected * 8);
-  if (actual <= expected / 8) diff += 4;
-  else if (actual <= expected / 4) diff += 3;
-  else if (actual <= expected / 2) diff += 2;
-  else if (actual < expected) diff += 1;
-  else if (actual >= expected * 8) diff -= 4;
-  else if (actual >= expected * 4) diff -= 3;
-  else if (actual >= expected * 2) diff -= 2;
-  else if (actual > expected) diff -= 1;
+  if (actual <= expected / 4) diff += DAA_MAX_STEP;
+  else if (actual < Math.floor(expected * 3 / 4)) diff += 1;
+  else if (actual >= expected * 4) diff -= DAA_MAX_STEP;
+  else if (actual > Math.floor(expected * 3 / 2)) diff -= 1;
   return clamp(diff, MIN_DIFFICULTY, MAX_DIFFICULTY);
 }
 function saveChainSnapshot(): void {
@@ -399,12 +404,39 @@ let syncInProgress = false;
 let nextSyncAfter = 0;
 let lastRateSweep = 0;
 let nodeId = "";
+let nodePub = "";
+let nodeSecret = "";
 let listenScheme = "http";
 let listenHost = "127.0.0.1";
 let listenPort = DEFAULT_PORT;
 let advertisedOrigin = "";
 const selfOrigins = new Set<string>();
 const peerNodeIds = new Map<string, string>();
+function txFee(tx: Tx): bigint | null {
+  return parseUDec(tx?.fee);
+}
+function mempoolSenderCount(from: string): number {
+  let c = 0;
+  for (const tx of mempool.values()) if (tx.from === from) c++;
+  return c;
+}
+function evictLowestFeeFor(candidate: Tx): boolean {
+  const candidateFee = txFee(candidate);
+  if (candidateFee === null) return false;
+  let lowId = "";
+  let lowFee: bigint | null = null;
+  for (const [id, tx] of mempool) {
+    const fee = txFee(tx);
+    if (fee === null) continue;
+    if (lowFee === null || fee < lowFee || (fee === lowFee && id < lowId)) {
+      lowFee = fee;
+      lowId = id;
+    }
+  }
+  if (lowFee === null || candidateFee <= lowFee || !lowId) return false;
+  mempool.delete(lowId);
+  return true;
+}
 function hasMempoolNonceConflict(tx: Tx): boolean {
   if (tx.from === "COINBASE") return false;
   const n = parseUDec(tx.nonce);
@@ -493,16 +525,23 @@ function loadOrCreateNodeId(): void {
     if (fs.existsSync(NODE_FILE)) {
       const raw = fs.readFileSync(NODE_FILE, "utf8");
       const parsed = JSON.parse(raw);
-      if (typeof parsed?.nodeId === "string" && /^[0-9a-f]{64}$/.test(parsed.nodeId)) {
-        nodeId = parsed.nodeId;
-        return;
+      if (isPubKeyHex(parsed?.nodePub) && typeof parsed?.nodeSecret === "string" && isHex(parsed.nodeSecret) && parsed.nodeSecret.length === 128) {
+        if (pubFromSecretHex(parsed.nodeSecret) === parsed.nodePub) {
+          nodePub = parsed.nodePub;
+          nodeSecret = parsed.nodeSecret;
+          nodeId = sha256Hex(nodePub);
+          return;
+        }
       }
     }
   } catch {}
-  nodeId = sha256Hex(randomBytes(32));
+  const kp = genKeypair();
+  nodePub = kp.pub;
+  nodeSecret = kp.secret;
+  nodeId = sha256Hex(nodePub);
   try {
     const tmp = NODE_FILE + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify({ nodeId, createdAt: Date.now() }), "utf8");
+    fs.writeFileSync(tmp, JSON.stringify({ nodeId, nodePub, nodeSecret, createdAt: Date.now() }), "utf8");
     fs.renameSync(tmp, NODE_FILE);
   } catch (e: any) {
     console.error(`nodeid-save-failed: ${String(e?.message ?? e)}`);
@@ -562,9 +601,23 @@ function isPrivateOrLocalHostLiteral(hostname: string): boolean {
 async function hostIsBlocked(hostname: string): Promise<boolean> {
   const h = hostname.toLowerCase();
   const ipType = net.isIP(h);
-  if (ipType < 1) return true; // only literal IP peers: no DNS rebinding surface
+  if (ipType > 0) {
+    if (UNSAFE_DEV_MODE && ALLOW_PRIVATE_PEERS) return false;
+    return isPrivateOrLocalIp(h);
+  }
+  if (h === "localhost") return true;
   if (UNSAFE_DEV_MODE && ALLOW_PRIVATE_PEERS) return false;
-  return isPrivateOrLocalIp(h);
+  try {
+    const resolved = await dns.lookup(h, { all: true, verbatim: true });
+    if (!Array.isArray(resolved) || resolved.length < 1 || resolved.length > 32) return true;
+    for (const rec of resolved) {
+      const ip = typeof rec?.address === "string" ? rec.address : "";
+      if (net.isIP(ip) < 1 || isPrivateOrLocalIp(ip)) return true;
+    }
+    return false;
+  } catch {
+    return true;
+  }
 }
 function parseListenHost(args: Record<string, string | boolean>): string {
   if (args["host"]) return String(args["host"]).trim();
@@ -589,15 +642,49 @@ function isAdmin(req: http.IncomingMessage): boolean {
   if (UNSAFE_DEV_MODE && !STRICT_ADMIN && ALLOW_LOOPBACK_ADMIN && isLocalIp(remoteIp(req))) return true;
   return false;
 }
-function peerAuthHeaders(token = PEER_TOKEN): Record<string, string> {
-  if (!token) return {};
-  return { "x-peer-token": token };
+function headerOne(req: http.IncomingMessage, name: string): string {
+  const v = req.headers[name];
+  if (typeof v === "string") return v;
+  if (Array.isArray(v) && typeof v[0] === "string") return v[0];
+  return "";
 }
-function peerAuthOk(req: http.IncomingMessage): boolean {
-  if (!PEER_TOKEN) return true;
+function peerSigPayload(method: string, path: string, ts: string, pub: string): Uint8Array {
+  return sha256Bytes(JSON.stringify([CHAIN_ID, PROTOCOL_VERSION, method, path, ts, pub]));
+}
+function peerSign(method: string, path: string, ts: string, pub: string, secret: string): string {
+  return bytesToHex(nacl.sign.detached(peerSigPayload(method, path, ts, pub), hexToBytes(secret)));
+}
+function peerAuthHeaders(path = "", method = "GET", token = PEER_TOKEN): Record<string, string> {
+  const h: Record<string, string> = {};
+  if (token) h["x-peer-token"] = token;
+  if (path && nodePub && nodeSecret) {
+    const ts = String(Date.now());
+    h["x-peer-node"] = nodeId;
+    h["x-peer-pub"] = nodePub;
+    h["x-peer-ts"] = ts;
+    h["x-peer-sig"] = peerSign(method, path, ts, nodePub, nodeSecret);
+  }
+  return h;
+}
+function peerSignedOk(req: http.IncomingMessage, method: string, path: string): boolean {
+  const peerNode = headerOne(req, "x-peer-node");
+  const pub = headerOne(req, "x-peer-pub");
+  const ts = headerOne(req, "x-peer-ts");
+  const sig = headerOne(req, "x-peer-sig");
+  if (!isNodeIdHex(peerNode) || !isPubKeyHex(pub) || !isSigHex(sig)) return false;
+  if (peerNode !== sha256Hex(pub)) return false;
+  if (peerNode === nodeId) return false;
+  if (!/^[0-9]{10,16}$/.test(ts)) return false;
+  const tsNum = Number(ts);
+  if (!Number.isSafeInteger(tsNum) || Math.abs(Date.now() - tsNum) > PEER_SIG_MAX_SKEW_MS) return false;
+  return nacl.sign.detached.verify(peerSigPayload(method, path, ts, pub), hexToBytes(sig), hexToBytes(pub));
+}
+function peerAuthOk(req: http.IncomingMessage, method: string, path: string): boolean {
   if (UNSAFE_DEV_MODE && ALLOW_LOOPBACK_PEER_AUTH && isLocalIp(remoteIp(req))) return true;
-  const t = req.headers["x-peer-token"];
-  return typeof t === "string" && safeEq(PEER_TOKEN, t);
+  const t = headerOne(req, "x-peer-token");
+  if (PEER_TOKEN && !(t && safeEq(PEER_TOKEN, t))) return false;
+  if (path !== "/chain") return true;
+  return peerSignedOk(req, method, path);
 }
 function sweepRateState(now: number): void {
   if (now - lastRateSweep < RATE_SWEEP_MS && rateState.size <= RATE_STATE_CAP) return;
@@ -632,7 +719,7 @@ function normPeerSyntax(p: string): string {
   try {
     const u = new URL(p);
     if ((u.protocol !== "http:" && u.protocol !== "https:") || u.username || u.password || u.pathname !== "/" || u.search || u.hash) return "";
-    if (net.isIP(u.hostname) < 1) return "";
+    if (!u.hostname) return "";
     if (isPrivateOrLocalHostLiteral(u.hostname)) return "";
     return u.origin;
   } catch {
@@ -788,10 +875,10 @@ async function postJsonRead(peer: string, path: string, body: any, maxBytes = 25
   }
 }
 function broadcastTx(tx: Tx): void {
-  for (const p of peers) void postJson(p, "/tx", tx, peerAuthHeaders());
+  for (const p of peers) void postJson(p, "/tx", tx, peerAuthHeaders("/tx", "POST"));
 }
 function broadcastBlock(b: Block): void {
-  for (const p of peers) void postJson(p, "/block", b, peerAuthHeaders());
+  for (const p of peers) void postJson(p, "/block", b, peerAuthHeaders("/block", "POST"));
 }
 function selectTxsForBlock(st: State): { txs: Tx[]; fees: bigint } {
   const temp = cloneState(st);
@@ -968,19 +1055,24 @@ async function fetchChainRange(peer: string, fromHeight: number, tipHeight: numb
   if (!Number.isSafeInteger(fromHeight) || !Number.isSafeInteger(tipHeight)) return null;
   if (fromHeight < 0 || tipHeight < fromHeight) return null;
   const out: Block[] = [];
+  let from = fromHeight;
   let chunks = 0;
-  for (let from = fromHeight; from <= tipHeight; from += CHAIN_CHUNK_BLOCKS) {
+  while (from <= tipHeight) {
     chunks++;
     if (chunks > MAX_SYNC_CHUNKS_PER_ATTEMPT) return null;
-    const limit = Math.min(CHAIN_CHUNK_BLOCKS, tipHeight + 1 - from);
-    const resp = await getJson(peer, `/chain?from=${from}&limit=${limit}`, MAX_SYNC_RESPONSE_BYTES, peerAuthHeaders());
+    const resp = await getJson(peer, `/chain?from=${from}&maxBytes=${CHAIN_PAGE_TARGET_BYTES}`, MAX_SYNC_RESPONSE_BYTES, peerAuthHeaders("/chain", "GET"));
     if (!resp || !Array.isArray(resp.blocks)) return null;
     const blocks = resp.blocks as Block[];
-    if (blocks.length < 1 || blocks.length > limit) return null;
+    if (blocks.length < 1 || blocks.length > CHAIN_CHUNK_BLOCKS) return null;
     for (let i = 0; i < blocks.length; i++) {
-      if (blocks[i]?.header?.height !== from + i) return null;
+      const h = blocks[i]?.header?.height;
+      if (h !== from + i || h > tipHeight) return null;
     }
     out.push(...blocks);
+    let nextFrom = from + blocks.length;
+    if (Number.isSafeInteger(resp.nextFrom) && resp.nextFrom >= nextFrom) nextFrom = resp.nextFrom;
+    if (nextFrom <= from) return null;
+    from = nextFrom;
   }
   return out;
 }
@@ -1001,8 +1093,8 @@ async function maybeSyncFromPeers(): Promise<void> {
         dropPeer(p);
         continue;
       }
-      const tip = await getJson(p, "/tip", 64_000, peerAuthHeaders());
-      if (!tip || tip.chainId !== CHAIN_ID || tip.protocol !== PROTOCOL_VERSION || typeof tip.work !== "string" || !Number.isSafeInteger(tip.height) || !isNodeIdHex(tip.nodeId)) {
+      const tip = await getJson(p, "/tip", 64_000, peerAuthHeaders("/tip", "GET"));
+      if (!tip || tip.chainId !== CHAIN_ID || tip.protocol !== PROTOCOL_VERSION || typeof tip.work !== "string" || !Number.isSafeInteger(tip.height) || !isNodeIdHex(tip.nodeId) || !isPubKeyHex(tip.nodePub) || sha256Hex(tip.nodePub) !== tip.nodeId) {
         markPeerFailure(p);
         continue;
       }
@@ -1043,7 +1135,7 @@ async function maybeSyncFromPeers(): Promise<void> {
         markPeerSuccess(p);
         continue;
       }
-      const anchor = Math.max(0, chain.length - 1 - RETARGET_INTERVAL);
+      const anchor = Math.max(0, chain.length - 1 - DAA_WINDOW);
       const tail = await fetchChainRange(p, anchor, syncTip);
       if (!tail) {
         markPeerFailure(p);
@@ -1122,15 +1214,15 @@ function startServer(port: number, host: string, tls: { key: Buffer; cert: Buffe
       if (!rateLimitOk(req, method, url.pathname)) {
         return sendJson(res, 429, { error: "rate-limit" });
       }
-      const peerRoute = (method === "GET" && (url.pathname === "/hello" || url.pathname === "/tip" || url.pathname === "/chain")) ||
-        (method === "POST" && (url.pathname === "/tx" || url.pathname === "/block"));
-      if (peerRoute && !peerAuthOk(req)) return sendJson(res, 403, { error: "peer-auth" });
+      const peerRoute = method === "GET" && (url.pathname === "/hello" || url.pathname === "/tip" || url.pathname === "/chain");
+      if (peerRoute && !peerAuthOk(req, method, url.pathname)) return sendJson(res, 403, { error: "peer-auth" });
       if (method === "GET" && url.pathname === "/hello") {
         return sendJson(res, 200, {
           chainId: CHAIN_ID,
           protocol: PROTOCOL_VERSION,
           app: APP_VERSION,
           nodeId,
+          nodePub,
           origin: nodeOrigin(),
           now: Date.now(),
         });
@@ -1146,6 +1238,7 @@ function startServer(port: number, host: string, tls: { key: Buffer; cert: Buffe
           difficulty: expectedDifficultyForNext(chain),
           work: totalWork.toString(),
           nodeId,
+          nodePub,
           origin: nodeOrigin(),
           peers: Array.from(peers),
         });
@@ -1153,10 +1246,20 @@ function startServer(port: number, host: string, tls: { key: Buffer; cert: Buffe
       if (method === "GET" && url.pathname === "/chain") {
         const from = Number(url.searchParams.get("from") ?? "0");
         const start = Number.isFinite(from) ? Math.floor(from) : 0;
-        if (start < 0 || start >= chain.length) return sendJson(res, 200, { blocks: [] });
-        const lim = Number(url.searchParams.get("limit") ?? String(CHAIN_CHUNK_BLOCKS));
-        const limit = Number.isFinite(lim) ? clamp(Math.floor(lim), 1, CHAIN_CHUNK_BLOCKS) : CHAIN_CHUNK_BLOCKS;
-        return sendJson(res, 200, { blocks: chain.slice(start, start + limit) });
+        const tipHeight = chain.length - 1;
+        if (start < 0 || start >= chain.length) return sendJson(res, 200, { blocks: [], nextFrom: start, tipHeight });
+        const mb = Number(url.searchParams.get("maxBytes") ?? String(CHAIN_PAGE_TARGET_BYTES));
+        const maxBytes = Number.isFinite(mb) ? clamp(Math.floor(mb), 64_000, MAX_SYNC_RESPONSE_BYTES) : CHAIN_PAGE_TARGET_BYTES;
+        const blocks: Block[] = [];
+        let bytes = 2;
+        for (let i = start; i < chain.length && blocks.length < CHAIN_CHUNK_BLOCKS; i++) {
+          const b = chain[i];
+          const bsz = Buffer.byteLength(JSON.stringify(b)) + (blocks.length > 0 ? 1 : 0);
+          if (blocks.length > 0 && bytes + bsz > maxBytes) break;
+          bytes += bsz;
+          blocks.push(b);
+        }
+        return sendJson(res, 200, { blocks, nextFrom: start + blocks.length, tipHeight });
       }
       if (method === "GET" && url.pathname === "/state") {
         const acct = url.searchParams.get("acct");
@@ -1179,8 +1282,8 @@ function startServer(port: number, host: string, tls: { key: Buffer; cert: Buffe
         const p = typeof body?.peer === "string" ? await normPeer(body.peer) : "";
         if (!p) return sendJson(res, 400, { error: "bad-peer" });
         if (isSelfPeerOrigin(p)) return sendJson(res, 400, { error: "self-peer" });
-        const hello = await getJson(p, "/hello", 64_000, peerAuthHeaders());
-        if (!hello || hello.chainId !== CHAIN_ID || hello.protocol !== PROTOCOL_VERSION || !isNodeIdHex(hello.nodeId)) {
+        const hello = await getJson(p, "/hello", 64_000, peerAuthHeaders("/hello", "GET"));
+        if (!hello || hello.chainId !== CHAIN_ID || hello.protocol !== PROTOCOL_VERSION || !isNodeIdHex(hello.nodeId) || !isPubKeyHex(hello.nodePub) || sha256Hex(hello.nodePub) !== hello.nodeId) {
           return sendJson(res, 400, { error: "peer-incompatible" });
         }
         if (hello.nodeId === nodeId || !registerPeerNodeId(p, hello.nodeId)) return sendJson(res, 400, { error: "self-peer" });
@@ -1196,20 +1299,28 @@ function startServer(port: number, host: string, tls: { key: Buffer; cert: Buffe
         return sendJson(res, 200, { ok: true, peers: Array.from(peers) });
       }
       if (method === "POST" && url.pathname === "/tx") {
+        if (!OPEN_RELAY && !peerAuthOk(req, method, url.pathname)) return sendJson(res, 403, { error: "peer-auth" });
         const tx = (await readJson(req)) as Tx;
         if (!tx || typeof tx !== "object") return sendJson(res, 400, { error: "bad-json" });
         const id = txId(tx);
         if (seenTxs.has(id)) return sendJson(res, 200, { ok: true, dup: true });
-        if (mempool.size >= MAX_MEMPOOL) return sendJson(res, 429, { error: "mempool-full" });
-        if (hasMempoolNonceConflict(tx)) return sendJson(res, 409, { error: "mempool-nonce-conflict" });
         const err = validateNormalTx(tx, state);
         if (err) return sendJson(res, 400, { error: err });
+        const fee = txFee(tx);
+        if (fee === null) return sendJson(res, 400, { error: "bad-fee" });
+        if (fee < MIN_RELAY_FEE) return sendJson(res, 400, { error: "relay-fee-too-low" });
+        if (tx.from !== "COINBASE" && mempoolSenderCount(tx.from) >= MAX_MEMPOOL_PER_SENDER) {
+          return sendJson(res, 429, { error: "mempool-sender-limit" });
+        }
+        if (hasMempoolNonceConflict(tx)) return sendJson(res, 409, { error: "mempool-nonce-conflict" });
+        if (mempool.size >= MAX_MEMPOOL && !evictLowestFeeFor(tx)) return sendJson(res, 429, { error: "mempool-full" });
         mempool.set(id, tx);
         rememberSeen(seenTxs, seenTxQueue, id, SEEN_TX_CAP);
         broadcastTx(tx);
         return sendJson(res, 200, { ok: true, txid: id });
       }
       if (method === "POST" && url.pathname === "/block") {
+        if (!OPEN_RELAY && !peerAuthOk(req, method, url.pathname)) return sendJson(res, 403, { error: "peer-auth" });
         const b = (await readJson(req)) as Block;
         if (!b || typeof b !== "object") return sendJson(res, 400, { error: "bad-json" });
         if (isHashHex(b.hash) && seenBlocks.has(b.hash)) return sendJson(res, 200, { ok: true, dup: true });
@@ -1308,11 +1419,12 @@ function usage(): void {
     "  --seeds=<origin,...> --seed-file=<path> (also env: TINYCHAIN_BOOTSTRAP_SEEDS / TINYCHAIN_SEED_FILE)",
     "  --tls-cert=<pem> --tls-key=<pem>  (or env: TINYCHAIN_TLS_CERT/TINYCHAIN_TLS_KEY)",
     "  --advertise=<origin,origin,...> (optional announced origins)",
-    "  public bind requires: --advertise + TLS + TINYCHAIN_ADMIN_TOKEN + TINYCHAIN_PEER_TOKEN + TINYCHAIN_SNAPSHOT_KEY",
+    "  public bind requires: --advertise + TLS + TINYCHAIN_ADMIN_TOKEN + TINYCHAIN_SNAPSHOT_KEY",
     "  --difficulty is disabled (frozen network profile)",
     "security/env:",
     "  STRICT admin is ON by default; set TINYCHAIN_ADMIN_TOKEN for admin routes",
-    "  peer auth: set TINYCHAIN_PEER_TOKEN; peers must send x-peer-token",
+    "  peer auth (optional): set TINYCHAIN_PEER_TOKEN; peers send x-peer-token",
+    "  relay policy: TINYCHAIN_OPEN_RELAY=1 (default) keeps /tx and /block permissionless",
     "  unsafe dev toggles require: TINYCHAIN_UNSAFE_DEV=I_UNDERSTAND",
     "  then optionally: TINYCHAIN_STRICT_ADMIN=0 TINYCHAIN_ALLOW_LOOPBACK_ADMIN=1 TINYCHAIN_ALLOW_PRIVATE_PEERS=1",
     "  loopback peer-auth bypass (dev only): TINYCHAIN_ALLOW_LOOPBACK_PEER_AUTH=1",
@@ -1463,17 +1575,17 @@ function adminHeadersFromArgs(args: Record<string, string | boolean>): Record<st
   if (args["admin-token"]) h["x-admin-token"] = String(args["admin-token"]);
   return h;
 }
-function peerHeadersFromArgs(args: Record<string, string | boolean>): Record<string, string> {
-  if (args["peer-token"]) return peerAuthHeaders(String(args["peer-token"]));
-  return peerAuthHeaders();
+function peerHeadersFromArgs(args: Record<string, string | boolean>, path = "", method = "GET"): Record<string, string> {
+  if (args["peer-token"]) return peerAuthHeaders(path, method, String(args["peer-token"]));
+  return peerAuthHeaders(path, method);
 }
 async function cliGet(node: string, path: string, args: Record<string, string | boolean>, maxBytes = 512_000): Promise<any> {
-  const out = await getJson(node, path, maxBytes, peerHeadersFromArgs(args));
+  const out = await getJson(node, path, maxBytes, peerHeadersFromArgs(args, new URL(path, "http://x").pathname, "GET"));
   if (!out) throw new Error(`request-failed ${path}`);
   return out;
 }
 async function cliPost(node: string, path: string, body: any, args: Record<string, string | boolean>, maxBytes = 512_000): Promise<any> {
-  const out = await postJsonRead(node, path, body, maxBytes, { ...peerHeadersFromArgs(args), ...adminHeadersFromArgs(args) });
+  const out = await postJsonRead(node, path, body, maxBytes, { ...peerHeadersFromArgs(args, path, "POST"), ...adminHeadersFromArgs(args) });
   if (!out) throw new Error(`request-failed ${path}`);
   if (!out.ok) throw new Error(`request-rejected ${path} status=${out.status} body=${JSON.stringify(out.body)}`);
   return out;
@@ -1566,8 +1678,9 @@ function makeRetargetVector(diff: number, spanMs: number): Block[] {
   const out: Block[] = [makeGenesis()];
   out[0].header.difficulty = clamp(diff, MIN_DIFFICULTY, MAX_DIFFICULTY);
   out[0].header.timestamp = GENESIS_TIMESTAMP;
-  for (let i = 1; i < RETARGET_INTERVAL; i++) {
-    const ts = GENESIS_TIMESTAMP + Math.floor((spanMs * i) / (RETARGET_INTERVAL - 1));
+  const n = Math.max(2, DAA_WINDOW);
+  for (let i = 1; i < n; i++) {
+    const ts = GENESIS_TIMESTAMP + Math.floor((spanMs * i) / (n - 1));
     out.push({
       header: {
         prev: ZERO32,
@@ -1608,12 +1721,12 @@ function runSelfTest(): void {
   bad[2].hash = blockHash(bad[2].header, bad[2].miner);
   const badRes = validateWholeChain(bad);
   if (badRes.ok || !String(badRes.err).startsWith("mtp@")) throw new Error("selftest-mtp");
-  const expectedSpan = TARGET_BLOCK_MS * RETARGET_INTERVAL;
+  const expectedSpan = TARGET_BLOCK_MS * (Math.max(2, DAA_WINDOW) - 1);
   const base = 20;
   const fast = expectedDifficultyForNext(makeRetargetVector(base, Math.floor(expectedSpan / 32)));
-  if (fast !== clamp(base + 4, MIN_DIFFICULTY, MAX_DIFFICULTY)) throw new Error("selftest-retarget-fast");
+  if (fast !== clamp(base + DAA_MAX_STEP, MIN_DIFFICULTY, MAX_DIFFICULTY)) throw new Error("selftest-retarget-fast");
   const slow = expectedDifficultyForNext(makeRetargetVector(base, expectedSpan * 32));
-  if (slow !== clamp(base - 4, MIN_DIFFICULTY, MAX_DIFFICULTY)) throw new Error("selftest-retarget-slow");
+  if (slow !== clamp(base - DAA_MAX_STEP, MIN_DIFFICULTY, MAX_DIFFICULTY)) throw new Error("selftest-retarget-slow");
   const flat = expectedDifficultyForNext(makeRetargetVector(base, expectedSpan));
   if (flat !== base) throw new Error("selftest-retarget-flat");
   const floor = expectedDifficultyForNext(makeRetargetVector(MIN_DIFFICULTY, expectedSpan * 32));
@@ -1707,7 +1820,7 @@ async function main(): Promise<void> {
     return;
   }
   if (args["difficulty"]) throw new Error("--difficulty is disabled on frozen mainnet profile");
-  if ((!STRICT_ADMIN || ALLOW_LOOPBACK_ADMIN || ALLOW_PRIVATE_PEERS || ALLOW_LOOPBACK_PEER_AUTH) && !UNSAFE_DEV_MODE) {
+  if ((!STRICT_ADMIN || ALLOW_LOOPBACK_ADMIN || ALLOW_PRIVATE_PEERS || ALLOW_LOOPBACK_PEER_AUTH || !OPEN_RELAY) && !UNSAFE_DEV_MODE) {
     throw new Error("unsafe toggles require TINYCHAIN_UNSAFE_DEV=I_UNDERSTAND");
   }
   if (STRICT_ADMIN && !ADMIN_TOKEN) throw new Error("strict admin mode requires TINYCHAIN_ADMIN_TOKEN");
@@ -1725,7 +1838,6 @@ async function main(): Promise<void> {
     if (!args["advertise"]) throw new Error("public bind requires --advertise");
     if (!tlsEnabled) throw new Error("public bind requires TLS cert/key");
     if (!STRICT_ADMIN || !ADMIN_TOKEN) throw new Error("public bind requires strict admin token");
-    if (!PEER_TOKEN) throw new Error("public bind requires TINYCHAIN_PEER_TOKEN");
     if (!SNAPSHOT_KEY) throw new Error("public bind requires TINYCHAIN_SNAPSHOT_KEY");
   }
   let tls: { key: Buffer; cert: Buffer } | null = null;
@@ -1751,6 +1863,8 @@ async function main(): Promise<void> {
   }
   startServer(port, host, tls);
   void maybeSyncFromPeers();
+  const syncTimer = setInterval(() => { void maybeSyncFromPeers(); }, SYNC_INTERVAL_MS);
+  syncTimer.unref?.();
   if (args["mine"]) {
     const minerPub = String(args["mine"]);
     if (!isPubKeyHex(minerPub)) throw new Error("bad --mine (expected 32-byte pubkey hex)");

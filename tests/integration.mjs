@@ -106,6 +106,14 @@ async function main() {
 
     const unauthTip = await fetchJson(`${origin(a.port)}/tip`);
     assert(unauthTip.status === 403, `expected 403 on unauth /tip, got ${unauthTip.status}`);
+    const chainUnsigned = await fetchJson(`${origin(a.port)}/chain?from=0&maxBytes=128000`, { headers: peerHeaders() });
+    assert(chainUnsigned.status === 403, `expected 403 on unsigned /chain, got ${chainUnsigned.status}`);
+    const openTx = await fetchJson(`${origin(a.port)}/tx`, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: "{}",
+    });
+    assert(openTx.status !== 403, `expected permissionless /tx path, got ${openTx.status}`);
 
     await waitUntil("node A mine >=1 block", 120_000, async () => {
       const t = await fetchJson(`${origin(a.port)}/tip`, { headers: peerHeaders() });
@@ -187,7 +195,7 @@ async function main() {
     assert(b.logs().includes("snapshot-load-failed"), "missing snapshot-load-failed log after tamper");
     assert(Number(tipAfterTamper.body?.height) >= 1, `expected recovery sync after tampered snapshot, got ${tipAfterTamper.text}`);
 
-    console.log(JSON.stringify({ ok: true, tests: ["peer-auth-required", "sync-path", "peer-token-mismatch", "snapshot-mac-tamper-recovery"] }, null, 2));
+    console.log(JSON.stringify({ ok: true, tests: ["peer-auth-required", "signed-chain-auth", "open-relay-route", "sync-path", "peer-token-mismatch", "snapshot-mac-tamper-recovery"] }, null, 2));
   } catch (e) {
     for (const n of nodes) {
       console.error(`\n--- logs ${n.name}@${n.port} ---\n${n.logs()}`);
