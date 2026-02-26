@@ -96,10 +96,9 @@ If binding non-loopback (`--public` or non-local `--host`), startup requires:
 - `--advertise=<origin,...>`
 - TLS cert + key (`--tls-cert`, `--tls-key`, or env)
 - `TINYCHAIN_ADMIN_TOKEN` (strict admin)
+- `TINYCHAIN_PEER_TOKEN`
 - `TINYCHAIN_SNAPSHOT_KEY`
 - no `TINYCHAIN_UNSAFE_DEV`
-
-Recommended (not strictly required): `TINYCHAIN_PEER_TOKEN`.
 
 Example:
 
@@ -151,7 +150,7 @@ Write:
 Auth model:
 
 - `GET /hello`, `GET /tip`, `GET /chain` are peer routes.
-- If `TINYCHAIN_PEER_TOKEN` is set, peer routes require `x-peer-token`.
+- Peer routes require `x-peer-token` whenever `TINYCHAIN_PEER_TOKEN` is configured (and public bind enforces it).
 - `GET /chain` additionally requires signed headers: `x-peer-node`, `x-peer-pub`, `x-peer-ts`, `x-peer-nonce`, `x-peer-sig`.
 - Admin routes require `x-admin-token`.
 - `/tx` and `/block` are permissionless by default (`TINYCHAIN_OPEN_RELAY=1`).
@@ -199,7 +198,7 @@ Intentional minimalism:
 ## Key Environment Variables
 
 - `TINYCHAIN_ADMIN_TOKEN`: admin auth token (required in strict mode)
-- `TINYCHAIN_PEER_TOKEN`: peer auth token (recommended for public network)
+- `TINYCHAIN_PEER_TOKEN`: peer auth token (required for public bind)
 - `TINYCHAIN_SNAPSHOT_KEY`: snapshot MAC key (required for public bind)
 - `TINYCHAIN_NODE_SECRET_KEY`: node secret-at-rest encryption key (falls back to snapshot key)
 - `TINYCHAIN_REQUIRE_PEER_TLS`: TLS-first peer origins (`1` default)

@@ -1533,11 +1533,11 @@ function usage(): void {
     "  --seeds=<origin,...> --seed-file=<path> (also env: TINYCHAIN_BOOTSTRAP_SEEDS / TINYCHAIN_SEED_FILE)",
     "  --tls-cert=<pem> --tls-key=<pem>  (or env: TINYCHAIN_TLS_CERT/TINYCHAIN_TLS_KEY)",
     "  --advertise=<origin,origin,...> (optional announced origins)",
-    "  public bind requires: --advertise + TLS + TINYCHAIN_ADMIN_TOKEN + TINYCHAIN_SNAPSHOT_KEY",
+    "  public bind requires: --advertise + TLS + TINYCHAIN_ADMIN_TOKEN + TINYCHAIN_PEER_TOKEN + TINYCHAIN_SNAPSHOT_KEY",
     "  --difficulty is disabled (frozen network profile)",
     "security/env:",
     "  STRICT admin is ON by default; set TINYCHAIN_ADMIN_TOKEN for admin routes",
-    "  peer auth (optional): set TINYCHAIN_PEER_TOKEN; peers send x-peer-token",
+    "  peer auth: set TINYCHAIN_PEER_TOKEN; peers send x-peer-token",
     "  peer transport defaults to TLS-only origins; override with TINYCHAIN_REQUIRE_PEER_TLS=0 (unsafe/dev)",
     "  relay policy: TINYCHAIN_OPEN_RELAY=1 (default) keeps /tx and /block permissionless",
     "  outbound rpc timeout: TINYCHAIN_HTTP_TIMEOUT_MS (default 5000)",
@@ -1955,6 +1955,7 @@ async function main(): Promise<void> {
     if (!args["advertise"]) throw new Error("public bind requires --advertise");
     if (!tlsEnabled) throw new Error("public bind requires TLS cert/key");
     if (!STRICT_ADMIN || !ADMIN_TOKEN) throw new Error("public bind requires strict admin token");
+    if (!PEER_TOKEN) throw new Error("public bind requires TINYCHAIN_PEER_TOKEN");
     if (!SNAPSHOT_KEY) throw new Error("public bind requires TINYCHAIN_SNAPSHOT_KEY");
   }
   let tls: { key: Buffer; cert: Buffer } | null = null;
