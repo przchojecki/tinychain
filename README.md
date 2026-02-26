@@ -1,50 +1,49 @@
 # tinychain
 
-`tinychain` is a small-chain engineering project: we build intentionally tiny, auditable blockchains where consensus-critical logic stays compact enough for one person to read in a sitting. The project favors pragmatic minimalism over feature sprawl so that node behavior, economics, and networking can be reasoned about directly from source.
+`tinychain` is a compact blockchain engineering project focused on single-file, auditable node implementations. The core idea is to keep consensus-critical behavior small enough that one engineer can read and reason about the entire system quickly, without hiding risk in large framework layers.
 
-The roadmap is line-budgeted by design. `tiny001.ts` is the strict sub-1000 LOC baseline (minimal but hardened enough to run), while `tiny002.ts` expands the same architecture under a sub-2000 LOC ceiling to add stronger public-network safety: better peer admission, authenticated peer traffic, optional TLS, encrypted wallets, and richer operator CLI/menu flows.
+The roadmap is intentionally line-budgeted. `tiny001.ts` is the strict sub-1000 LOC baseline, and `tiny002.ts` is the hardened sub-2000 LOC evolution designed to be serious public-testnet ready while remaining compact and understandable.
 
 ## Current Track
 
 - Active core: `tiny002.ts`
-- Core LOC: `1764`
+- Core LOC: `1995`
 - Runtime: Node.js `>=24`
-- Consensus style: single-file PoW chain with strict validation, simple account model, and HTTP-based gossip/sync
+- Consensus style: single-file PoW chain with strict validation, account model, HTTP gossip/sync, signed peer auth for chain sync
 - Baseline core: `tiny001.ts`
 - Core LOC: `996`
 - Runtime: Node.js `>=24`
-- Consensus style: single-file PoW chain with strict validation, simple account model, and HTTP-based gossip/sync (minimal profile)
+- Consensus style: minimal single-file PoW chain profile
 
 ## Status (February 26, 2026)
 
-`tiny002` is now a strong release candidate for a serious public **testnet** launch.
+`tiny002` has completed hardening items 1-6 and is launch-ready from an implementation perspective (with item 7 intentionally deferred).
 
-Already implemented:
+Recent hardening added:
 
-- Strict peer auth boundary (no implicit loopback bypass unless explicit unsafe-dev flag)
-- Snapshot integrity metadata + keyed snapshot MAC verification (`TINYCHAIN_SNAPSHOT_KEY`)
-- Public-bind safety guardrails (TLS + advertise + auth secrets required)
-- Encrypted wallet keystore (AES-256-GCM + scrypt) with hidden passphrase prompt
-- Peer/node identity hardening (`nodeId`, self-peer and duplicate-node rejection)
-- CI matrix + deterministic selftest + adversarial multi-node integration test
+1. TLS-first peer origin policy (default `https` peers only)
+2. Stronger economics profile (raised PoW floor + subsidy halving schedule)
+3. Node peer-signing secret encryption at rest (`node.json`)
+4. Replay protection for signed peer auth (`x-peer-nonce` + bounded replay cache)
+5. Safer outbound networking defaults (`TINYCHAIN_HTTP_TIMEOUT_MS`, default 5000ms)
+6. Proper nonce-based RBF in mempool with minimum fee bump policy
 
 ## Repository Layout
 
 - `tiny002.ts`: active implementation (<2000 LOC target)
-- `tiny001.ts`: previous constrained implementation (<1000 LOC target)
+- `tiny001.ts`: constrained baseline (<1000 LOC target)
 - `tests/integration.mjs`: multi-node integration/adversarial checks
-- `.github/workflows/ci.yml`: CI (`check`, `selftest`, `itest`)
 - `README.md`: this document
 
 ## Quick Start
 
-### 1) Install deps
+Install:
 
 ```bash
 npm ci
 ```
 
-### 2) Verify build + tests
+Verify:
 
 ```bash
 npm run check
@@ -52,7 +51,7 @@ npm run selftest
 npm run itest
 ```
 
-### 3) Generate keys
+Generate a keypair:
 
 ```bash
 npm run keygen
@@ -60,7 +59,7 @@ npm run keygen
 
 ## Local Two-Node Dev Smoke Run
 
-Local private peers are blocked by default. For localhost testing only, run with explicit unsafe-dev toggles.
+Private/local peers are blocked by default. For localhost dev only, use explicit unsafe-dev toggles.
 
 Terminal A:
 
@@ -84,22 +83,23 @@ TINYCHAIN_SNAPSHOT_KEY=dev-snapshot \
 npm run node -- --port=3002 --peers=http://127.0.0.1:3001
 ```
 
-Query with peer token:
+Check tip:
 
 ```bash
 curl -sS http://127.0.0.1:3001/tip -H 'x-peer-token: dev-peer'
 ```
 
-## Public Launch Guardrails (Enforced)
+## Public Bind Guardrails (Enforced)
 
-If binding non-loopback (`--public` or `--host` not localhost/127.0.0.1/::1), startup now requires:
+If binding non-loopback (`--public` or non-local `--host`), startup requires:
 
 - `--advertise=<origin,...>`
-- TLS cert + key (`--tls-cert`, `--tls-key` or env variants)
-- `TINYCHAIN_ADMIN_TOKEN`
-- `TINYCHAIN_PEER_TOKEN`
+- TLS cert + key (`--tls-cert`, `--tls-key`, or env)
+- `TINYCHAIN_ADMIN_TOKEN` (strict admin)
 - `TINYCHAIN_SNAPSHOT_KEY`
-- No `TINYCHAIN_UNSAFE_DEV`
+- no `TINYCHAIN_UNSAFE_DEV`
+
+Recommended (not strictly required): `TINYCHAIN_PEER_TOKEN`.
 
 Example:
 
@@ -116,23 +116,6 @@ npm run node -- \
   --seeds=https://198.51.100.11:3001,https://198.51.100.12:3001
 ```
 
-## Bootstrap / Seed Strategy
-
-Startup peer candidates are merged from:
-
-1. persisted peer snapshot (`.tinychain/peers.json`)
-2. `TINYCHAIN_BOOTSTRAP_SEEDS`
-3. `--seeds=<origin,...>`
-4. `TINYCHAIN_SEED_FILE`
-5. `--seed-file=<path>`
-6. `--peers=<origin,...>`
-
-Operational recommendation:
-
-- Publish 3-5 stable public seed nodes.
-- Version and publish a canonical seed file.
-- Rotate seeds via rolling updates, not all at once.
-
 ## CLI Highlights (`tiny002.ts`)
 
 - Node/startup: `--port`, `--host`, `--public`, `--mine`, `--advertise`
@@ -140,12 +123,12 @@ Operational recommendation:
 - RPC client ops: `--tip`, `--state`, `--mempool`, `--list-peers`, `--add-peer`, `--sync-now`
 - Wallet: `--wallet-new`, `--wallet-pub`, `--wallet`, `--wallet-pass`
 - TX: `--sign-tx`, `--send-tx`, `--tx`, `--secret`
-- UX: `--menu`, `--selftest`, `--keygen`
+- UX/tools: `--menu`, `--selftest`, `--keygen`
 
-Useful CLI auth flags:
+Auth flags:
 
 - `--admin-token=<token>` for admin routes
-- `--peer-token=<token>` for peer-authenticated reads/writes
+- `--peer-token=<token>` for peer-authenticated routes
 
 ## HTTP API
 
@@ -153,7 +136,7 @@ Read:
 
 - `GET /hello`
 - `GET /tip`
-- `GET /chain?from=<height>&limit=<n>`
+- `GET /chain?from=<height>&maxBytes=<n>`
 - `GET /state?acct=<pubhex>`
 - `GET /mempool`
 - `GET /peers`
@@ -167,45 +150,69 @@ Write:
 
 Auth model:
 
-- Peer routes require `x-peer-token` when `TINYCHAIN_PEER_TOKEN` is set.
+- `GET /hello`, `GET /tip`, `GET /chain` are peer routes.
+- If `TINYCHAIN_PEER_TOKEN` is set, peer routes require `x-peer-token`.
+- `GET /chain` additionally requires signed headers: `x-peer-node`, `x-peer-pub`, `x-peer-ts`, `x-peer-nonce`, `x-peer-sig`.
 - Admin routes require `x-admin-token`.
+- `/tx` and `/block` are permissionless by default (`TINYCHAIN_OPEN_RELAY=1`).
 
-## Consensus Snapshot
+## Consensus Snapshot (tiny002)
 
 - Chain ID: `tinychain-main-001`
 - Block target: `10s`
-- Retarget interval: `20`
-- Difficulty bounds: `[8..40]`, initial `18`
+- DAA window: `60`, max adjustment step: `2`
+- Difficulty bounds: `[14..40]`, initial `18`
 - MTP window: `11`
 - Max future skew: `2 minutes`
+- Block subsidy: `50`, halving interval `210000` blocks
 - Max non-coinbase tx per block: `200`
+- Chain sync pagination: `CHAIN_CHUNK_BLOCKS=256`, byte-capped pages
 - Chain selection: greatest accumulated work
+
+Mempool policy:
+
+- Max mempool: `5000`
+- Max sender entries: `64`
+- Min relay fee: `1`
+- RBF: same-sender same-nonce replacement requires fee bump `>= max(+10%, +1)`
 
 ## Security Model Summary
 
 Implemented:
 
-- Canonical tx/header validation and bounded numeric economics
-- PoW difficulty schedule with bounded retarget adjustments
-- Rate limits + bounded rate state
-- Peer admission hardening + peer cap + peer failure eviction
-- Peer auth token and admin token controls
-- Snapshot atomic writes + metadata + optional keyed MAC verification
-- Encrypted wallet storage (v2) and hidden passphrase prompt
+- Canonical tx/header validation and bounded integer economics
+- Bounded DAA with strict full-chain revalidation on sync
+- Peer admission hardening and private/link-local peer blocking by default
+- TLS-first peer origin policy
+- Peer token auth + signed `/chain` requests + replay protection
+- Snapshot integrity metadata + optional keyed MAC verification
+- Node identity persistence with encrypted secret-at-rest support
+- Wallet encryption (AES-256-GCM + scrypt) and hidden passphrase prompt
+- Rate limits, peer failure eviction, and bounded in-memory state structures
 
-Still intentionally minimal:
+Intentional minimalism:
 
-- HTTP-based gossip instead of full encrypted p2p protocol stack
-- No economic finality gadgets beyond work-based longest-chain rule
-- Toy-scale PoW economics (appropriate for testnet / experimental network)
+- HTTP-based gossip (not a custom encrypted P2P transport)
+- No finality gadget beyond PoW work selection
+- Compact codebase prioritized over feature breadth
+
+## Key Environment Variables
+
+- `TINYCHAIN_ADMIN_TOKEN`: admin auth token (required in strict mode)
+- `TINYCHAIN_PEER_TOKEN`: peer auth token (recommended for public network)
+- `TINYCHAIN_SNAPSHOT_KEY`: snapshot MAC key (required for public bind)
+- `TINYCHAIN_NODE_SECRET_KEY`: node secret-at-rest encryption key (falls back to snapshot key)
+- `TINYCHAIN_REQUIRE_PEER_TLS`: TLS-first peer origins (`1` default)
+- `TINYCHAIN_HTTP_TIMEOUT_MS`: outbound RPC timeout (`5000` default)
+- `TINYCHAIN_OPEN_RELAY`: permissionless `/tx` + `/block` when `1` (default)
+- `TINYCHAIN_UNSAFE_DEV=I_UNDERSTAND`: unlock unsafe dev toggles
 
 ## Release Checklist (tiny002)
 
 - [x] `npm run check`
 - [x] `npm run selftest`
 - [x] `npm run itest`
-- [x] CI matrix on Node 24/25 with lockfile (`npm ci`)
-- [ ] Add LICENSE before broad public distribution
+- [ ] Add `LICENSE` before broad public release
 
 ## License
 

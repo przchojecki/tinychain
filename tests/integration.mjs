@@ -1,10 +1,12 @@
 import { spawn } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import nacl from "tweetnacl";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ENTRY = path.join(ROOT, "tiny002.ts");
@@ -14,7 +16,26 @@ const BIN = process.execPath;
 const ADMIN_TOKEN = "itest-admin";
 const PEER_TOKEN = "itest-peer";
 const SNAPSHOT_KEY = "itest-snapshot-key";
-const MINER = "1".repeat(64);
+const CHAIN_ID = "tinychain-main-001";
+const PROTOCOL_VERSION = 2;
+function bytesToHex(b) {
+  return Buffer.from(b).toString("hex");
+}
+function sha256Hex(data) {
+  return createHash("sha256").update(data).digest("hex");
+}
+function sha256Bytes(data) {
+  return createHash("sha256").update(data).digest();
+}
+function keypair(seedByte) {
+  const seed = new Uint8Array(32).fill(seedByte);
+  const kp = nacl.sign.keyPair.fromSeed(seed);
+  return { pub: bytesToHex(kp.publicKey), secret: bytesToHex(kp.secretKey) };
+}
+const MINER_KP = keypair(1);
+const RECEIVER_KP = keypair(2);
+const PEER_SIGNER = keypair(3);
+const MINER = MINER_KP.pub;
 
 const BASE_ENV = {
   TINYCHAIN_ADMIN_TOKEN: ADMIN_TOKEN,
@@ -38,6 +59,27 @@ function adminHeaders() {
 }
 function jsonHeaders(extra = {}) {
   return { "content-type": "application/json", ...extra };
+}
+function signTx(secret, to, amount, fee, nonce) {
+  const from = Buffer.from(secret, "hex").subarray(32).toString("hex");
+  const tx = { from, to, amount, fee, nonce, sig: "" };
+  const msg = sha256Bytes(JSON.stringify([CHAIN_ID, tx.from, tx.to, tx.amount, tx.fee, tx.nonce]));
+  tx.sig = bytesToHex(nacl.sign.detached(msg, Buffer.from(secret, "hex")));
+  return tx;
+}
+function signedPeerHeaders(pathname, method = "GET", token = PEER_TOKEN) {
+  const ts = String(Date.now());
+  const nonce = randomBytes(12).toString("hex");
+  const sigPayload = JSON.stringify([CHAIN_ID, PROTOCOL_VERSION, method, pathname, ts, nonce, PEER_SIGNER.pub]);
+  const sig = bytesToHex(nacl.sign.detached(sha256Bytes(sigPayload), Buffer.from(PEER_SIGNER.secret, "hex")));
+  return {
+    "x-peer-token": token,
+    "x-peer-node": sha256Hex(PEER_SIGNER.pub),
+    "x-peer-pub": PEER_SIGNER.pub,
+    "x-peer-ts": ts,
+    "x-peer-nonce": nonce,
+    "x-peer-sig": sig,
+  };
 }
 function extractErr(e) {
   return String(e?.message ?? e);
@@ -108,12 +150,20 @@ async function main() {
     assert(unauthTip.status === 403, `expected 403 on unauth /tip, got ${unauthTip.status}`);
     const chainUnsigned = await fetchJson(`${origin(a.port)}/chain?from=0&maxBytes=128000`, { headers: peerHeaders() });
     assert(chainUnsigned.status === 403, `expected 403 on unsigned /chain, got ${chainUnsigned.status}`);
+    const chainSigned = await fetchJson(`${origin(a.port)}/chain?from=0&maxBytes=128000`, { headers: signedPeerHeaders("/chain", "GET") });
+    assert(chainSigned.status === 200, `expected 200 on signed /chain, got ${chainSigned.status}`);
+    const replayHeaders = signedPeerHeaders("/chain", "GET");
+    const chainReplayA = await fetchJson(`${origin(a.port)}/chain?from=0&maxBytes=128000`, { headers: replayHeaders });
+    const chainReplayB = await fetchJson(`${origin(a.port)}/chain?from=0&maxBytes=128000`, { headers: replayHeaders });
+    assert(chainReplayA.status === 200 && chainReplayB.status === 403, `expected replay reject for signed /chain, got ${chainReplayA.status}/${chainReplayB.status}`);
     const openTx = await fetchJson(`${origin(a.port)}/tx`, {
       method: "POST",
       headers: jsonHeaders(),
       body: "{}",
     });
     assert(openTx.status !== 403, `expected permissionless /tx path, got ${openTx.status}`);
+    const nodeDoc = JSON.parse(fs.readFileSync(path.join(a.dataDir, "node.json"), "utf8"));
+    assert(!nodeDoc?.nodeSecret && typeof nodeDoc?.nodeSecretEnc?.ciphertext === "string", "expected encrypted node secret at rest");
 
     await waitUntil("node A mine >=1 block", 120_000, async () => {
       const t = await fetchJson(`${origin(a.port)}/tip`, { headers: peerHeaders() });
@@ -129,6 +179,29 @@ async function main() {
       const t = await fetchJson(`${origin(a.port)}/tip`, { headers: peerHeaders() });
       return t.status === 200 && Number(t.body?.height) >= targetHeight;
     });
+    const tx1 = signTx(MINER_KP.secret, RECEIVER_KP.pub, "1", "1", "1");
+    const tx1Post = await fetchJson(`${origin(a.port)}/tx`, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify(tx1),
+    });
+    assert(tx1Post.status === 200 && tx1Post.body?.replaced === false, `expected first tx accepted, got ${tx1Post.status} ${tx1Post.text}`);
+    const txLowBump = signTx(MINER_KP.secret, RECEIVER_KP.pub, "2", "1", "1");
+    const txLowPost = await fetchJson(`${origin(a.port)}/tx`, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify(txLowBump),
+    });
+    assert(txLowPost.status === 409 && txLowPost.body?.error === "rbf-fee-too-low", `expected low bump rejection, got ${txLowPost.status} ${txLowPost.text}`);
+    const tx2 = signTx(MINER_KP.secret, RECEIVER_KP.pub, "1", "2", "1");
+    const tx2Post = await fetchJson(`${origin(a.port)}/tx`, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify(tx2),
+    });
+    assert(tx2Post.status === 200 && tx2Post.body?.replaced === true, `expected RBF replacement, got ${tx2Post.status} ${tx2Post.text}`);
+    const mempoolAfterRbf = await fetchJson(`${origin(a.port)}/mempool`, { headers: peerHeaders() });
+    assert(mempoolAfterRbf.status === 200 && Array.isArray(mempoolAfterRbf.body?.txs) && mempoolAfterRbf.body.txs.length === 1 && mempoolAfterRbf.body.txs[0]?.fee === "2", `expected mempool replacement outcome, got ${mempoolAfterRbf.text}`);
 
     const addPeer = await fetchJson(`${origin(b.port)}/peers`, {
       method: "POST",
@@ -176,6 +249,18 @@ async function main() {
       body: JSON.stringify({ peer: origin(c.port) }),
     });
     assert(addBad.status === 400 && addBad.body?.error === "peer-incompatible", `expected peer-incompatible, got ${addBad.status} ${addBad.text}`);
+    const d = startNode("d", 4104, [], { TINYCHAIN_UNSAFE_DEV: "", TINYCHAIN_ALLOW_PRIVATE_PEERS: "0" });
+    nodes.push(d);
+    await waitUntil("node D tip", 20_000, async () => {
+      const t = await fetchJson(`${origin(d.port)}/tip`, { headers: peerHeaders() });
+      return t.status === 200;
+    });
+    const addHttpPeer = await fetchJson(`${origin(d.port)}/peers`, {
+      method: "POST",
+      headers: jsonHeaders(adminHeaders()),
+      body: JSON.stringify({ peer: "http://example.com" }),
+    });
+    assert(addHttpPeer.status === 400 && addHttpPeer.body?.error === "bad-peer", `expected http peer rejection, got ${addHttpPeer.status} ${addHttpPeer.text}`);
 
     await stopNode(b);
     const chainPath = path.join(b.dataDir, "chain.json");
@@ -195,7 +280,7 @@ async function main() {
     assert(b.logs().includes("snapshot-load-failed"), "missing snapshot-load-failed log after tamper");
     assert(Number(tipAfterTamper.body?.height) >= 1, `expected recovery sync after tampered snapshot, got ${tipAfterTamper.text}`);
 
-    console.log(JSON.stringify({ ok: true, tests: ["peer-auth-required", "signed-chain-auth", "open-relay-route", "sync-path", "peer-token-mismatch", "snapshot-mac-tamper-recovery"] }, null, 2));
+    console.log(JSON.stringify({ ok: true, tests: ["peer-auth-required", "signed-chain-auth", "signed-chain-replay-reject", "open-relay-route", "node-secret-at-rest-encrypted", "rbf-fee-bump", "tls-only-peer-policy", "sync-path", "peer-token-mismatch", "snapshot-mac-tamper-recovery"] }, null, 2));
   } catch (e) {
     for (const n of nodes) {
       console.error(`\n--- logs ${n.name}@${n.port} ---\n${n.logs()}`);
